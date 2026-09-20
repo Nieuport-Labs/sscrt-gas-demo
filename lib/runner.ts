@@ -16,8 +16,18 @@
 // itself, before and after.
 import { MsgExecuteContract } from "secretjs";
 import type { Msg, Permit } from "secretjs";
-import { config } from "./config";
-import { getSscrtCodeHash, querySscrtBalance, queryGrantRemainingUscrt, type Connection } from "./secret";
+import { config, PROVIDER_PERMIT_TTL_SECONDS } from "./config";
+import {
+  getSscrtCodeHash,
+  newProviderPermitName,
+  queryGrantRemainingUscrt,
+  querySscrtBalance,
+  revokePermitMessages,
+  signExpiringPermit,
+  GAS_REVOKE_PERMIT,
+  type Connection,
+} from "./secret";
+import { clearPendingRevokes, pendingRevokes } from "./pendingRevokes";
 import {
   GAS_PRICE_USCRT,
   GAS_TOPUP,
@@ -228,6 +238,13 @@ async function runHonest(ctx: Ctx): Promise<RunResult> {
   const gas = await ensureGas(ctx);
   if (gas.blocked) return ctx.finish("error", gas.blocked);
 
+  // Any permit the provider was given rides out with this transaction. One signature, one fee,
+  // a little more gas — which is the only reason it can be automatic at all.
+  const toRevoke = pendingRevokes(ctx.connection.address);
+  if (toRevoke.length > 0) {
+    ctx.log("info", `zároveň odvolávám ${toRevoke.length} permit providera — jede to v téže transakci`);
+  }
+
   ctx.log("info", "odesílám převod, poplatek platí gas vault");
   const tx = await ctx.connection.client.tx.broadcast(
     [
@@ -237,14 +254,22 @@ async function runHonest(ctx: Ctx): Promise<RunResult> {
         code_hash: ctx.codeHash,
         msg: { transfer: { recipient: ctx.recipient, amount: ctx.amountBase } },
       }),
+      ...revokePermitMessages(ctx.connection, ctx.codeHash, toRevoke),
     ],
     {
-      gasLimit: GAS_TRANSFER,
+      gasLimit: GAS_TRANSFER + GAS_REVOKE_PERMIT * toRevoke.length,
       gasPriceInFeeDenom: GAS_PRICE_USCRT,
       feeDenom: "uscrt",
       feeGranter: config.gasVaultAddress,
     },
   );
+
+  // Only once it is on chain. A failed transaction leaves them queued for the next one, which is
+  // the whole reason the list is not cleared optimistically.
+  if (tx.code === 0 && toRevoke.length > 0) {
+    clearPendingRevokes(ctx.connection.address, toRevoke);
+    ctx.log("ok", "permit providera je odvolaný v kontraktu — už tvůj zůstatek nepřečte");
+  }
 
   ctx.result.txHash = tx.transactionHash;
   ctx.result.txCode = tx.code;
@@ -332,7 +357,22 @@ function describeCreditState(status: CreditStatus): string {
 
 /** The cold start. Returns an error string, or undefined when the credits arrived. */
 async function buyFirstCredits(ctx: Ctx): Promise<string | undefined> {
-  const onboard = await providerApi.onboard(ctx.connection.address, ctx.permit);
+  // A permit of its own, and one that dies on its own. Not the one this app reads the balance
+  // with: the expiry is per permit, so a shared one could not be taken from the provider without
+  // blinding the app too.
+  const permitName = newProviderPermitName();
+  const minutes = Math.round(PROVIDER_PERMIT_TTL_SECONDS / 60);
+  ctx.log(
+    "info",
+    `podepisuji permit pro providera s platností ${minutes} min — potřebuje ověřit, že platba projde`,
+  );
+  const providerPermit = await signExpiringPermit(
+    ctx.connection.address,
+    permitName,
+    PROVIDER_PERMIT_TTL_SECONDS,
+  );
+
+  const onboard = await providerApi.onboard(ctx.connection.address, providerPermit);
   if (!onboard.ok) return `provider tuhle adresu nepřijal: ${onboard.error} — ${onboard.message}`;
   ctx.log(
     "info",

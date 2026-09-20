@@ -25,4 +25,22 @@ export const SSCRT_DECIMALS = 6;
 /** The permit's name is part of what the user signs, so changing it invalidates every stored one. */
 export const PERMIT_NAME = "sscrt-gas-demo-balance";
 
+/**
+ * Prefix for the separate, single-use permit the provider is given.
+ *
+ * Separate because revocation is keyed by permit name: one shared permit could not be taken
+ * away from the provider without blinding this app too. Single-use because a revoked name stays
+ * revoked, so each cold start needs its own.
+ */
+export const PROVIDER_PERMIT_PREFIX = "sscrt-gas-demo-provider-";
+
+/**
+ * How long the provider's permit stays readable.
+ *
+ * It has to outlive the purchase — the quote and the submit both re-read the balance — and
+ * nothing else. Fifteen minutes matches the bootstrap allowance it is paired with, and both
+ * lapse on their own without anybody paying for it.
+ */
+export const PROVIDER_PERMIT_TTL_SECONDS = 900;
+
 export const MSG_EXECUTE_CONTRACT_TYPE_URL = "/secret.compute.v1beta1.MsgExecuteContract";

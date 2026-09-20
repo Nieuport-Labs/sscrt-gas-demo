@@ -9,7 +9,7 @@ import { ReceiveModal } from "@/components/ReceiveModal";
 import { SendModal } from "@/components/SendModal";
 import { SettingsModal } from "@/components/SettingsModal";
 import { WalletMenu } from "@/components/WalletMenu";
-import { config } from "@/lib/config";
+import { config, PERMIT_NAME } from "@/lib/config";
 import { formatTokenAmount, formatUsd, scrt } from "@/lib/format";
 import { providerApi, type ProviderStatus } from "@/lib/provider";
 import { readCreditStatus, type CreditStatus } from "@/lib/gasCredits";
@@ -19,7 +19,7 @@ import {
   connectKeplr,
   getSscrtCodeHash,
   querySscrtBalance,
-  revokeBalancePermit,
+  revokePermits,
   signBalancePermit,
   type Connection,
 } from "@/lib/secret";
@@ -40,9 +40,11 @@ export default function Home() {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [permit, setPermit] = useState<Permit | null>(null);
   const [balance, setBalance] = useState<string | null>(null);
-  const [creditPrice, setCreditPrice] = useState<string | null>(null);
+  // Read from /status, which is public. It used to come from /onboard — which meant merely
+  // connecting a wallet handed the provider a permit to read its balance, for nothing but a
+  // price that was on the status page all along.
+  const creditPrice = status?.creditsForSale?.priceSscrt ?? null;
   const [credits, setCredits] = useState<CreditStatus | null>(null);
-  const [onboardError, setOnboardError] = useState<string | null>(null);
 
   const [dialog, setDialog] = useState<Dialog>(null);
   const [run, setRun] = useState<RunResult | null>(null);
@@ -113,19 +115,6 @@ export default function Home() {
     }
   }, []);
 
-  // Asked only so the price can be shown before anyone commits to anything. The provider is not
-  // involved again unless the wallet turns out to be cold.
-  const loadCreditPrice = useCallback(async (address: string, activePermit: Permit) => {
-    const result = await providerApi.onboard(address, activePermit);
-    if (result.ok) {
-      setCreditPrice(result.data.creditPriceSscrt);
-      setOnboardError(null);
-    } else {
-      setCreditPrice(null);
-      setOnboardError(result.message);
-    }
-  }, []);
-
   const connect = async () => {
     setError(null);
     setBusy(true);
@@ -139,7 +128,6 @@ export default function Home() {
         setPermit(parsed);
         await refreshBalance(parsed);
         await refreshCredits(conn.address);
-        await loadCreditPrice(conn.address, parsed);
       }
     } catch (err) {
       setError((err as Error).message);
@@ -158,7 +146,6 @@ export default function Home() {
       setPermit(signed);
       await refreshBalance(signed);
       await refreshCredits(connection.address);
-      await loadCreditPrice(connection.address, signed);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -172,9 +159,7 @@ export default function Home() {
     setConnection(null);
     setPermit(null);
     setBalance(null);
-    setCreditPrice(null);
     setCredits(null);
-    setOnboardError(null);
     setDialog(null);
   };
 
@@ -182,7 +167,6 @@ export default function Home() {
     if (connection) window.localStorage.removeItem(permitKey(connection.address));
     setPermit(null);
     setBalance(null);
-    setCreditPrice(null);
     setDialog(null);
   };
 
@@ -198,7 +182,7 @@ export default function Home() {
     setError(null);
     setBusy(true);
     try {
-      const result = await revokeBalancePermit(connection, await getSscrtCodeHash());
+      const result = await revokePermits(connection, await getSscrtCodeHash(), [PERMIT_NAME]);
       if (result.code !== 0) throw new Error(`kontrakt permit neodvolal (code ${result.code}): ${result.rawLog}`);
       forgetPermit();
     } catch (err) {
@@ -334,11 +318,6 @@ export default function Home() {
           </div>
         )}
 
-        {onboardError && (
-          <div className="banner err">
-            <strong>Provider tuhle adresu nepřijal.</strong> {onboardError}
-          </div>
-        )}
 
         {error && (
           <div className="banner err">

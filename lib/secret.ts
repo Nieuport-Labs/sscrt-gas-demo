@@ -1,7 +1,7 @@
 // Everything that talks to Secret Network directly: wallet connection, the read-only client,
 // the balance permit, and two public LCD queries the app uses to check its own work.
 import { MsgExecuteContract, SecretNetworkClient, type Permit } from "secretjs";
-import { config, PERMIT_NAME } from "./config";
+import { config, PERMIT_NAME, PROVIDER_PERMIT_PREFIX } from "./config";
 
 export interface Connection {
   address: string;
@@ -28,6 +28,12 @@ interface KeplrLike {
   getKey(chainId: string): Promise<{ bech32Address: string; pubKey: Uint8Array }>;
   getOfflineSignerOnlyAmino(chainId: string): unknown;
   getEnigmaUtils(chainId: string): unknown;
+  signAmino(
+    chainId: string,
+    signer: string,
+    signDoc: unknown,
+    options?: { preferNoSetFee?: boolean; preferNoSetMemo?: boolean },
+  ): Promise<{ signed: unknown; signature: { pub_key: { type: string; value: string }; signature: string } }>;
   defaultOptions?: { sign?: { preferNoSetFee?: boolean; preferNoSetMemo?: boolean } };
 }
 
@@ -87,18 +93,102 @@ export async function getSscrtCodeHash(): Promise<string> {
 
 /**
  * A SNIP-24 permit: an off-chain signature, no gas, no on-chain footprint, revocable. It is what
- * lets this app — and the provider — read a private sSCRT balance without ever holding a viewing
- * key.
+ * lets this app — and, once, the provider — read a private sSCRT balance without ever holding a
+ * viewing key.
+ *
+ * The name is a parameter because the app and the provider must not share one. Revocation is
+ * keyed by name, so a single shared permit could not be taken away from the provider without
+ * also blinding this app. Two permits, two names, and only one of them ever leaves the browser.
  */
-export async function signBalancePermit(address: string, client: SecretNetworkClient): Promise<Permit> {
+export async function signBalancePermit(
+  address: string,
+  client: SecretNetworkClient,
+  permitName: string = PERMIT_NAME,
+): Promise<Permit> {
   return client.utils.accessControl.permit.sign(
     address,
     config.chainId,
-    PERMIT_NAME,
+    permitName,
     [config.sscrtContract],
     ["balance"],
     true, // browser path: Keplr's own signAmino, with the fee and memo fields hidden
   );
+}
+
+/**
+ * A fresh, single-use permit name for the provider.
+ *
+ * Unique every time, and that is load-bearing rather than tidy: the contract records a
+ * revocation against the *name*, so a name that has been revoked once is dead for good. Reusing
+ * it would hand the provider a permit that cannot read anything, and the failure would surface
+ * as an unexplained refusal at onboarding rather than as the mistake it is.
+ */
+export function newProviderPermitName(): string {
+  const suffix = Math.random().toString(36).slice(2, 10);
+  return `${PROVIDER_PERMIT_PREFIX}${Date.now().toString(36)}-${suffix}`;
+}
+
+/**
+ * A permit that stops working by itself.
+ *
+ * The original SNIP-24 permit has no expiry, which is why the only way to end one is an on-chain
+ * revocation costing gas. The sSCRT deployed on secret-4 is built against a secret-toolkit that
+ * added `created` and `expires` to `PermitParams` — and, decisively, put them inside
+ * `PermitContent`, which is the part that gets signed. So the expiry is bound by the signature:
+ * whoever holds the permit cannot extend it, because changing the field invalidates it.
+ *
+ * Verified rather than assumed. sSCRT is code id 2280; its wasm carries the `expires` field name
+ * beside `permit_name`, the error string "Permit has expired", and the contract pins
+ * SolarRepublic/secret-toolkit at df89b58, where `PermitContent` lists created and expires.
+ *
+ * `created` is deliberately omitted. It is optional outside blanket permits, and setting it
+ * invites a failure this cannot fix: the contract rejects a permit created after the current
+ * block time, so a browser clock a minute fast would produce a permit nothing accepts.
+ *
+ * The timestamp format is the one `iso8601_utc0_to_timestamp` accepts, which is exactly what
+ * `Date.prototype.toISOString` produces.
+ */
+export async function signExpiringPermit(
+  address: string,
+  permitName: string,
+  ttlSeconds: number,
+): Promise<Permit> {
+  const keplr = getKeplr();
+  const expires = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  const allowed_tokens = [config.sscrtContract];
+  const permissions = ["balance"];
+
+  // Amino canonicalises the document before signing, so the key order written here does not
+  // matter; what matters is that every field the contract reconstructs is present and identical.
+  const { signature } = await keplr.signAmino(
+    config.chainId,
+    address,
+    {
+      chain_id: config.chainId,
+      account_number: "0",
+      sequence: "0",
+      fee: { amount: [{ amount: "0", denom: "uscrt" }], gas: "1" },
+      msgs: [
+        {
+          type: "query_permit",
+          value: { permit_name: permitName, allowed_tokens, permissions, expires },
+        },
+      ],
+      memo: "",
+    },
+    { preferNoSetFee: true, preferNoSetMemo: true },
+  );
+
+  return {
+    params: {
+      chain_id: config.chainId,
+      permit_name: permitName,
+      allowed_tokens,
+      permissions,
+      expires,
+    },
+    signature,
+  } as unknown as Permit;
 }
 
 export async function querySscrtBalance(permit: Permit): Promise<string> {
@@ -115,30 +205,48 @@ export async function querySscrtBalance(permit: Permit): Promise<string> {
 }
 
 /**
- * Kill a permit on chain, for good.
+ * Messages that kill permits on chain, for good.
  *
  * SNIP-24 permits have no expiry: the signature stays valid until the contract is told to stop
  * honouring it. Deleting a copy — here, or on the provider's server — only removes that copy.
  * This is the version that does not depend on anyone keeping a promise.
  *
- * It costs gas, which is why the app can only offer it now: a wallet with gas credits can pay
- * for it out of the vault, and before credits existed it could not pay for anything.
+ * Returned as messages rather than sent, so they can ride along in a transaction the wallet was
+ * making anyway. That is what lets the provider's permit be revoked automatically: no second
+ * signature to approve, no second fee, just a little more gas on the next transfer.
+ *
+ * Confirmed supported by the sSCRT deployed on secret-4 (code id 2280) — its wasm carries the
+ * `revoke_permit` and `revoked` symbols.
  */
-export async function revokeBalancePermit(
+export function revokePermitMessages(
   connection: Connection,
   codeHash: string,
-): Promise<{ code: number; rawLog: string; txHash: string }> {
-  const tx = await connection.client.tx.broadcast(
-    [
+  permitNames: string[],
+): MsgExecuteContract<object>[] {
+  return permitNames.map(
+    (permit_name) =>
       new MsgExecuteContract({
         sender: connection.address,
         contract_address: config.sscrtContract,
         code_hash: codeHash,
-        msg: { revoke_permit: { permit_name: PERMIT_NAME } },
+        msg: { revoke_permit: { permit_name } },
       }),
-    ],
+  );
+}
+
+/** Gas for one revoke. Small, but the limit is what gets charged, so it is not free. */
+export const GAS_REVOKE_PERMIT = 90_000;
+
+/** Revoke on its own, when there is no transaction to attach it to. */
+export async function revokePermits(
+  connection: Connection,
+  codeHash: string,
+  permitNames: string[],
+): Promise<{ code: number; rawLog: string; txHash: string }> {
+  const tx = await connection.client.tx.broadcast(
+    revokePermitMessages(connection, codeHash, permitNames),
     {
-      gasLimit: 150_000,
+      gasLimit: GAS_REVOKE_PERMIT * permitNames.length,
       gasPriceInFeeDenom: 0.1,
       feeDenom: "uscrt",
       feeGranter: config.gasVaultAddress,

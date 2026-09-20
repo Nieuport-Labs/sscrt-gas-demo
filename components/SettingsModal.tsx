@@ -1,7 +1,7 @@
 "use client";
 
 import { Modal } from "./Modal";
-import { config } from "@/lib/config";
+import { config, PROVIDER_PERMIT_TTL_SECONDS } from "@/lib/config";
 import { scrt, sscrt } from "@/lib/format";
 import type { ProviderStatus } from "@/lib/provider";
 import type { CreditStatus } from "@/lib/gasCredits";
@@ -136,9 +136,15 @@ export function SettingsModal(props: {
 
       <h2>Co o tobě provider ví</h2>
       <p className="note" style={{ marginTop: 0 }}>
-        <strong>Zůstatek sSCRT, a jenom při nákupu prvních kreditů.</strong> Než na tebe utratí
+        <strong>Zůstatek sSCRT, a jen po dobu nákupu prvních kreditů.</strong> Než na tebe utratí
         vlastní gas, potřebuje vědět, že platba nepropadne — a zůstatek je privátní, takže si ho
-        přečte permitem. Jakmile kredity dodá, permit maže.
+        přečte permitem.
+      </p>
+      <p className="note">
+        <strong>Ten permit dostane vlastní a platí {Math.round(PROVIDER_PERMIT_TTL_SECONDS / 60)}{" "}
+        minut.</strong> Pak ho kontrakt přestane uznávat, ať už si ho server smazal nebo ne. Doba
+        platnosti je součástí toho, co podepisuješ, takže ji nejde prodloužit — změna podpis
+        zneplatní. Není to slib, je to vlastnost.
       </p>
       <p className="note">
         <strong>Co nevidí:</strong> komu posíláš a kolik. Ty transakce podepisuješ sám proti
@@ -146,9 +152,9 @@ export function SettingsModal(props: {
         adresa, čas a zaplacený poplatek.
       </p>
       <p className="note">
-        <strong>Smazání permitu na serveru je slib, ne důkaz.</strong> SNIP-24 permit nemá
-        expiraci: dokud ho neodvoláš v kontraktu, podpis platí a kdokoli s jeho kopií si tvůj
-        zůstatek přečte. Odvolání stojí gas — což je právě to, co ti kredity umožňují zaplatit.
+        Permit níž je <strong>jiný</strong> — ten, kterým tenhle prohlížeč čte tvůj zůstatek.
+        Nikam se neposílá a expiraci nemá, protože ho appka potřebuje pořád. Odvolat ho jde
+        v kontraktu; zapomenutí smaže jen kopii tady.
       </p>
       <div style={{ display: "flex", gap: "0.6rem", flexWrap: "wrap" }}>
         <button className="btn" onClick={props.onForgetPermit}>
