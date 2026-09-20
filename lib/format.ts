@@ -35,3 +35,20 @@ export function shortenAddress(address: string, lead = 10, tail = 6): string {
   if (address.length <= lead + tail + 1) return address;
   return `${address.slice(0, lead)}…${address.slice(-tail)}`;
 }
+
+/**
+ * Base units in, a figure a person can read out. Amounts are integers everywhere they are stored,
+ * sent or signed — only the last step before a human eye converts them, so no rounding ever
+ * reaches the money itself.
+ */
+export function scrt(base: string | bigint | number): string {
+  return `${trimTrailingZeros(fromBaseUnits(String(base)))} SCRT`;
+}
+
+export function sscrt(base: string | bigint | number): string {
+  return `${trimTrailingZeros(fromBaseUnits(String(base)))} sSCRT`;
+}
+
+function trimTrailingZeros(value: string): string {
+  return value.includes(".") ? value.replace(/0+$/, "").replace(/\.$/, "") : value;
+}

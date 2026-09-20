@@ -1,18 +1,25 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { ArrowDownLeft, ArrowUpRight, FlaskConical, Settings } from "lucide-react";
 import type { Permit } from "secretjs";
-import { SendCard } from "@/components/SendCard";
-import { RunLog, ScenarioPicker } from "@/components/TestPanel";
+import { Modal } from "@/components/Modal";
+import { ProgressModal } from "@/components/ProgressModal";
+import { ReceiveModal } from "@/components/ReceiveModal";
+import { SendModal } from "@/components/SendModal";
+import { SettingsModal } from "@/components/SettingsModal";
+import { WalletMenu } from "@/components/WalletMenu";
 import { config } from "@/lib/config";
-import { toBaseUnits } from "@/lib/format";
+import { formatTokenAmount, formatUsd, scrt } from "@/lib/format";
 import { providerApi, type ProviderStatus } from "@/lib/provider";
+import { readCreditStatus, type CreditStatus } from "@/lib/gasCredits";
 import { runScenario, type RunResult } from "@/lib/runner";
 import type { ScenarioId } from "@/lib/scenarios";
 import {
   connectKeplr,
+  getSscrtCodeHash,
   querySscrtBalance,
-  queryGrantRemainingUscrt,
+  revokeBalancePermit,
   signBalancePermit,
   type Connection,
 } from "@/lib/secret";
@@ -21,6 +28,9 @@ import {
  * keeping so a reload doesn't mean another Keplr prompt. It grants read access to one balance
  * and nothing else. */
 const permitKey = (address: string) => `sscrt-gas-demo:permit:${config.chainId}:${address}`;
+const DEV_MODE_KEY = "sscrt-gas-demo:devMode";
+
+type Dialog = "send" | "receive" | "settings" | null;
 
 export default function Home() {
   const [status, setStatus] = useState<ProviderStatus | null>(null);
@@ -30,15 +40,32 @@ export default function Home() {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [permit, setPermit] = useState<Permit | null>(null);
   const [balance, setBalance] = useState<string | null>(null);
-  const [hasGrant, setHasGrant] = useState<boolean | null>(null);
+  const [creditPrice, setCreditPrice] = useState<string | null>(null);
+  const [credits, setCredits] = useState<CreditStatus | null>(null);
+  const [onboardError, setOnboardError] = useState<string | null>(null);
 
-  const [recipient, setRecipient] = useState("");
-  const [amount, setAmount] = useState("");
-  const [scenario, setScenario] = useState<ScenarioId>("honest");
-
-  const [runs, setRuns] = useState<RunResult[]>([]);
+  const [dialog, setDialog] = useState<Dialog>(null);
+  const [run, setRun] = useState<RunResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [devMode, setDevMode] = useState(false);
+
+  useEffect(() => {
+    try {
+      setDevMode(window.localStorage.getItem(DEV_MODE_KEY) === "true");
+    } catch {
+      // Private mode, blocked storage: dev mode simply stays off, which is the safe default.
+    }
+  }, []);
+
+  const changeDevMode = (value: boolean) => {
+    setDevMode(value);
+    try {
+      window.localStorage.setItem(DEV_MODE_KEY, String(value));
+    } catch {
+      /* not worth surfacing */
+    }
+  };
 
   // --- provider status + price ---------------------------------------------------------------
 
@@ -74,9 +101,29 @@ export default function Home() {
     }
   }, []);
 
-  const refreshGrant = useCallback(async (address: string, providerAddress: string) => {
-    const remaining = await queryGrantRemainingUscrt(providerAddress, address);
-    setHasGrant(remaining !== null);
+  // Gas credits are public — a fee allowance and a bank balance are on chain in the clear — so
+  // reading them needs no permit and does not involve the provider at all.
+  const refreshCredits = useCallback(async (address: string) => {
+    try {
+      setCredits(await readCreditStatus(address));
+    } catch {
+      // A vault that cannot be reached is not the same as no credits, and guessing either way
+      // is worse than the dash the UI shows instead.
+      setCredits(null);
+    }
+  }, []);
+
+  // Asked only so the price can be shown before anyone commits to anything. The provider is not
+  // involved again unless the wallet turns out to be cold.
+  const loadCreditPrice = useCallback(async (address: string, activePermit: Permit) => {
+    const result = await providerApi.onboard(address, activePermit);
+    if (result.ok) {
+      setCreditPrice(result.data.creditPriceSscrt);
+      setOnboardError(null);
+    } else {
+      setCreditPrice(null);
+      setOnboardError(result.message);
+    }
   }, []);
 
   const connect = async () => {
@@ -91,8 +138,9 @@ export default function Home() {
         const parsed = JSON.parse(stored) as Permit;
         setPermit(parsed);
         await refreshBalance(parsed);
+        await refreshCredits(conn.address);
+        await loadCreditPrice(conn.address, parsed);
       }
-      if (status?.providerAddress) await refreshGrant(conn.address, status.providerAddress);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -109,6 +157,8 @@ export default function Home() {
       window.localStorage.setItem(permitKey(connection.address), JSON.stringify(signed));
       setPermit(signed);
       await refreshBalance(signed);
+      await refreshCredits(connection.address);
+      await loadCreditPrice(connection.address, signed);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -116,55 +166,68 @@ export default function Home() {
     }
   };
 
-  const onboard = async () => {
-    if (!connection || !permit || !status?.providerAddress) return;
+  /** Forgets the session in this tab only. Keplr keeps its own approval, and the permit stays in
+   * storage so reconnecting does not mean signing again. */
+  const disconnect = () => {
+    setConnection(null);
+    setPermit(null);
+    setBalance(null);
+    setCreditPrice(null);
+    setCredits(null);
+    setOnboardError(null);
+    setDialog(null);
+  };
+
+  const forgetPermit = () => {
+    if (connection) window.localStorage.removeItem(permitKey(connection.address));
+    setPermit(null);
+    setBalance(null);
+    setCreditPrice(null);
+    setDialog(null);
+  };
+
+  /**
+   * The version of "forget my permit" that does not rely on anyone keeping a promise.
+   *
+   * Forgetting deletes copies. Revoking tells the contract to stop honouring the signature, so
+   * neither this app nor the provider can use it again whatever either of them kept. It needs
+   * gas, which is exactly what gas credits are for.
+   */
+  const revokePermit = async () => {
+    if (!connection) return;
     setError(null);
     setBusy(true);
     try {
-      const result = await providerApi.onboard(connection.address, permit);
-      if (!result.ok) {
-        setError(`onboarding selhal (HTTP ${result.status} ${result.error}): ${result.message}`);
-        return;
-      }
-      await refreshGrant(connection.address, status.providerAddress);
+      const result = await revokeBalancePermit(connection, await getSscrtCodeHash());
+      if (result.code !== 0) throw new Error(`kontrakt permit neodvolal (code ${result.code}): ${result.rawLog}`);
+      forgetPermit();
     } catch (err) {
-      setError((err as Error).message);
+      setError(`odvolání permitu selhalo: ${(err as Error).message}`);
     } finally {
       setBusy(false);
     }
   };
 
-  // --- running a scenario --------------------------------------------------------------------
+  // --- sending -------------------------------------------------------------------------------
 
-  const amountBase = toBaseUnits(amount);
-  const recipientValid = /^secret1[0-9a-z]{38}$/.test(recipient.trim());
-
-  const run = async () => {
-    if (!connection || !permit || !status?.providerAddress || !amountBase) return;
+  const send = async (recipient: string, amountBase: string, scenario: ScenarioId) => {
+    if (!connection || !permit || !status?.providerAddress) return;
     setError(null);
+    setDialog(null);
     setBusy(true);
-
-    const upsert = (result: RunResult) =>
-      setRuns((previous) => {
-        const index = previous.findIndex((r) => r.id === result.id);
-        if (index === -1) return [result, ...previous];
-        const next = [...previous];
-        next[index] = result;
-        return next;
-      });
 
     try {
       await runScenario({
         connection,
         permit,
         providerAddress: status.providerAddress,
-        recipient: recipient.trim(),
+        recipient,
         amountBase,
         scenario,
-        onUpdate: upsert,
+        onUpdate: setRun,
       });
       await refreshBalance(permit);
-      await refreshGrant(connection.address, status.providerAddress);
+      await refreshCredits(connection.address);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -172,102 +235,158 @@ export default function Home() {
     }
   };
 
-  // --- what the big button does right now ----------------------------------------------------
+  // --- render --------------------------------------------------------------------------------
 
-  let ctaLabel = "Spustit scénář";
-  let ctaDisabled = false;
-  let onCta = run;
-
-  if (!connection) {
-    ctaLabel = "Připojit Keplr";
-    onCta = connect;
-  } else if (!permit) {
-    ctaLabel = "Odemknout zůstatek";
-    onCta = unlockBalance;
-  } else if (hasGrant === false) {
-    ctaLabel = "Zapnout sponzorovaný gas";
-    onCta = onboard;
-  } else if (!recipientValid) {
-    ctaLabel = "Zadej adresu příjemce";
-    ctaDisabled = true;
-  } else if (!amountBase || amountBase === "0") {
-    ctaLabel = "Zadej částku";
-    ctaDisabled = true;
-  } else if (scenario === "honest") {
-    ctaLabel = "Odeslat";
-  }
-
-  const footnote = (() => {
-    if (statusError) return `Provider ${config.providerUrl} neodpovídá: ${statusError}`;
-    if (status && !status.walletConfigured)
-      return "Provider běží, ale nemá nastavenou peněženku — nemůže vystavit fee grant. Dodělej to v jeho dashboardu.";
-    if (!connection) return "Zůstatek sSCRT je privátní. Přečte se až po podepsání permitu — off-chain, zdarma.";
-    if (!permit) return "Permit je podpis, ne transakce: žádný gas, žádný záznam na řetězci, kdykoli odvolatelný.";
-    if (hasGrant === false)
-      return "Provider ti vystaví fee grant, ze kterého bude platit nativní poplatky. Ty mu je vrátíš v sSCRT.";
-    if (status) return `Marže providera: ${status.config.feeMarkupPercent} % nad cenu gasu.`;
-    return null;
-  })();
+  const providerOnline = Boolean(status?.providerAddress);
+  const usdValue = balance !== null && priceUsd !== null ? (Number(balance) / 1e6) * priceUsd : null;
+  const canTransact = Boolean(connection && permit && providerOnline);
 
   return (
-    <main className="page">
-      <div className="shell">
-        <header className="masthead">
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <div className="mark">sS</div>
           <div>
-            <h1>sSCRT Gas Demo</h1>
-            <p>
-              Peněženka bez jediného SCRT pošle sSCRT a poplatek zaplatí taky v sSCRT — nativní gas
-              za ni složí provider a nechá si ho hned proplatit. Přepínač napravo dovolí zkusit
-              i to, co by uživatel dělat neměl.
-            </p>
+            <div className="name">sSCRT Gas</div>
+            <div className="sub">poplatky v sSCRT</div>
           </div>
-          <div className="row">
-            <span className="pill">{config.chainId}</span>
-            {!status ? (
-              <span className="pill danger">provider nedostupný</span>
-            ) : status.providerAddress ? (
-              <span className="pill ok">provider online</span>
-            ) : (
-              <span className="pill warn">provider bez peněženky</span>
-            )}
-            {priceUsd !== null && <span className="pill">SCRT ${priceUsd.toFixed(4)}</span>}
-          </div>
-        </header>
+        </div>
 
-        <div className="stack">
-          <SendCard
-            address={connection?.address ?? null}
-            balance={balance}
-            priceUsd={priceUsd}
-            amount={amount}
-            onAmountChange={setAmount}
-            recipient={recipient}
-            onRecipientChange={setRecipient}
-            onSubmit={onCta}
-            ctaLabel={ctaLabel}
-            ctaDisabled={ctaDisabled}
-            busy={busy}
-            footnote={footnote}
+        <div className="spacer" />
+
+        {devMode && (
+          <span className="status dev" title="Dev mode — v okně odesílání jde vybrat útočný scénář">
+            <FlaskConical />
+            dev
+          </span>
+        )}
+
+        <span className="status" title={statusError ?? config.providerUrl}>
+          <span className={`dot${providerOnline ? "" : status ? " warn" : " err"}`} />
+          {providerOnline ? "provider" : status ? "bez peněženky" : "nedostupný"}
+        </span>
+
+        {connection ? (
+          <WalletMenu
+            address={connection.address}
+            onSettings={() => setDialog("settings")}
+            onDisconnect={disconnect}
           />
+        ) : (
+          <>
+            <button className="btn primary" onClick={connect} disabled={busy}>
+              Připojit Keplr
+            </button>
+            <button className="icon-btn" onClick={() => setDialog("settings")} aria-label="Nastavení">
+              <Settings />
+            </button>
+          </>
+        )}
+      </header>
 
-          {error && (
-            <div className="banner danger">
-              <strong>Chyba.</strong> {error}
-            </div>
+      <main>
+        <div className="balance">
+          <div className="label">Zůstatek</div>
+          {balance !== null ? (
+            <>
+              <div className="amount">
+                {formatTokenAmount(balance)}
+                <span className="unit">sSCRT</span>
+              </div>
+              {usdValue !== null && <div className="fiat">{formatUsd(usdValue)}</div>}
+              {credits && (
+                <div className="fiat" title="Předplacený gas. Dobíjí se sám ze sSCRT, dokud je z čeho.">
+                  {credits.state === "unknown"
+                    ? "gas: vault neodpověděl"
+                    : `gas na ${scrt(credits.remainingUscrt ?? "0")}`}
+                  {credits.state === "cold" && " — první kredity koupí provider"}
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="amount" style={{ color: "var(--dim)" }}>
+                ••••<span className="unit">sSCRT</span>
+              </div>
+              <div className="locked">
+                {connection ? "Zůstatek je privátní — odemkni ho permitem." : "Připoj peněženku."}
+              </div>
+            </>
           )}
+        </div>
 
-          <div className="banner">
-            <strong>Tohle je testovací nástroj.</strong> Útočné scénáře posílají skutečné
-            transakce na {config.chainId} a stojí skutečné peníze — providera i tebe. Pouštěj je
-            proti své vlastní instanci a s drobnými částkami.
+        {connection && !permit && (
+          <button className="btn primary wide" style={{ marginTop: "1rem" }} onClick={unlockBalance} disabled={busy}>
+            Odemknout zůstatek
+          </button>
+        )}
+
+        {canTransact && (
+          <div className="actions">
+            <button className="btn act send" onClick={() => setDialog("send")} disabled={busy}>
+              <ArrowUpRight />
+              Odeslat
+            </button>
+            <button className="btn act receive" onClick={() => setDialog("receive")} disabled={busy}>
+              <ArrowDownLeft />
+              Přijmout
+            </button>
           </div>
-        </div>
+        )}
 
-        <div className="stack">
-          <ScenarioPicker selected={scenario} onSelect={setScenario} disabled={busy} />
-          <RunLog runs={runs} />
-        </div>
-      </div>
-    </main>
+        {onboardError && (
+          <div className="banner err">
+            <strong>Provider tuhle adresu nepřijal.</strong> {onboardError}
+          </div>
+        )}
+
+        {error && (
+          <div className="banner err">
+            <strong>Chyba.</strong> {error}
+          </div>
+        )}
+
+      </main>
+
+      {dialog === "send" && (
+        <SendModal
+          balance={balance}
+          priceUsd={priceUsd}
+          credits={credits}
+          devMode={devMode}
+          onClose={() => setDialog(null)}
+          onSend={send}
+        />
+      )}
+
+      {dialog === "receive" && connection && (
+        <ReceiveModal address={connection.address} onClose={() => setDialog(null)} />
+      )}
+
+      {dialog === "settings" && (
+        <SettingsModal
+          status={status}
+          statusError={statusError}
+          creditPriceSscrt={creditPrice}
+          credits={credits}
+          onRevokePermit={revokePermit}
+          devMode={devMode}
+          onDevModeChange={changeDevMode}
+          onForgetPermit={forgetPermit}
+          onClose={() => setDialog(null)}
+        />
+      )}
+
+      {run && <ProgressModal run={run} onClose={() => setRun(null)} />}
+
+      {busy && !run && dialog === null && (
+        <Modal title="Moment…">
+          <div style={{ display: "flex", gap: "0.7rem", alignItems: "center", color: "var(--muted)" }}>
+            <span className="spin" />
+            Čekám na peněženku.
+          </div>
+        </Modal>
+      )}
+    </div>
   );
 }
