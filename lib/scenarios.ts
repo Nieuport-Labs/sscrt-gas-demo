@@ -25,6 +25,8 @@ export type ScenarioId =
   | "replay"
   | "sequence_race"
   | "quote_flood"
+  | "refill"
+  | "refill_boundary"
   | "steal_bootstrap"
   | "double_onboard"
   | "topup_foreign_grantee";
@@ -102,6 +104,31 @@ export const SCENARIOS: Scenario[] = [
     what: "Vystřelí 15 žádostí o kvótu za sebou.",
     expected: "Rate limiter zabere a začne vracet HTTP 429.",
     note: "Po doběhnutí je adresa na minutu zablokovaná i pro ostatní testy.",
+  },
+  {
+    id: "refill",
+    kind: "guard",
+    title: "Dobití kreditů",
+    what:
+      "Vynutí dobití a změří obojí, na čem dobíjení stojí: že druhá zpráva utratí SCRT, který " +
+      "vydala první, a že transakce smí revokovat a znovu udělit grant, ze kterého sama platí.",
+    expected:
+      "Allowance po dobití = předtím − poplatek + dobitá částka, a nativní zůstatek se nezmění. " +
+      "Pokud tohle neplatí, dobíjení nemůže být jedna transakce.",
+    note: "Utratí gas a část sSCRT převede do vaultu — odtud se nevybírá, jen se protopí jako gas.",
+  },
+  {
+    id: "refill_boundary",
+    kind: "guard",
+    title: "Dobití na hraně nuly",
+    what:
+      "Totéž, ale s gas limitem nastaveným tak, aby poplatek vyčerpal allowance přesně na nulu. " +
+      "Chain v tu chvíli grant během transakce smaže a vault musí poznat rozdíl mezi „grant " +
+      "není“ a „nešlo se zeptat“.",
+    expected:
+      "Projde a allowance skončí přesně na dobité částce. Gas limit si volí klient, takže se na " +
+      "tuhle hranu dá trefit bez jakéhokoli privilegia.",
+    note: "Funguje jen když zbývající kredity zhruba odpovídají ceně jedné transakce.",
   },
   {
     id: "steal_bootstrap",

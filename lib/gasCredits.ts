@@ -137,6 +137,15 @@ export async function topUpGasCredits(
   gasTokenCodeHash: string,
   /** Who gets the credits. Defaults to the sender; the vault allows paying for someone else. */
   grantee: string = address,
+  /**
+   * Override the gas limit.
+   *
+   * Cosmos charges the limit rather than the usage, so this is also how much of the allowance
+   * the fee takes. Setting it to exactly what is left is the only way to reach the boundary
+   * where the chain deletes the grant mid-transaction — and it needs no privileged access,
+   * because the limit is the sender's to choose.
+   */
+  gasLimit: number = GAS_TOPUP,
 ): Promise<TxResponse> {
   const vaultCode = await getVaultCodeHash();
 
@@ -157,11 +166,16 @@ export async function topUpGasCredits(
   });
 
   return client.tx.broadcast([redeem, buy], {
-    gasLimit: GAS_TOPUP,
+    gasLimit,
     gasPriceInFeeDenom: GAS_PRICE_USCRT,
     feeDenom: "uscrt",
     feeGranter: config.gasVaultAddress,
   });
+}
+
+/** Native SCRT held, in base units. Public: no permit, no viewing key. */
+export async function nativeBalance(address: string): Promise<string> {
+  return queryNativeBalance(address);
 }
 
 /** How much to buy: the shortfall, or everything the wallet can afford, whichever is less. */

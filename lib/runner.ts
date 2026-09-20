@@ -20,6 +20,8 @@ import { config } from "./config";
 import { getSscrtCodeHash, querySscrtBalance, queryGrantRemainingUscrt, type Connection } from "./secret";
 import {
   GAS_PRICE_USCRT,
+  GAS_TOPUP,
+  nativeBalance,
   queryRemaining,
   readCreditStatus,
   refillAmount,
@@ -201,6 +203,10 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
         return await runSequenceRace(ctx);
       case "quote_flood":
         return await runQuoteFlood(ctx);
+      case "refill":
+        return await runRefill(ctx, false);
+      case "refill_boundary":
+        return await runRefill(ctx, true);
       case "steal_bootstrap":
         return await runStealBootstrap(ctx);
       case "double_onboard":
@@ -504,6 +510,118 @@ async function runQuoteFlood(ctx: Ctx): Promise<RunResult> {
   return limited > 0
     ? ctx.finish("as_expected", `Rate limiter zabral (${limited} z 15 na 429).`)
     : ctx.finish("vulnerable", "Patnáct kvót za sebou prošlo bez omezení.");
+}
+
+/**
+ * The two chain assumptions the refill rests on, measured rather than reasoned about.
+ *
+ *   1. The second message spends coins the first produced. Messages in a Cosmos transaction run
+ *      in order against one cached store, so they should be there — but "should" is not a basis
+ *      for shipping a refill that strands a wallet when it is wrong.
+ *
+ *   2. A transaction may revoke and re-grant the allowance paying its own fee. The vault tops up
+ *      by revoke-then-grant, and the fee is taken in the ante handler before any message runs.
+ *
+ * `boundary` goes after the nastier half of the second one: when the fee takes the allowance to
+ * exactly zero, the chain deletes the grant mid-transaction and the vault has to tell "no grant"
+ * apart from "could not ask". Reaching that needs no privileged access at all — Cosmos charges
+ * the gas limit rather than the usage, and the limit is the sender's to choose, so setting it to
+ * what is left drains the allowance to the uscrt.
+ */
+async function runRefill(ctx: Ctx, boundary: boolean): Promise<RunResult> {
+  const status = await readCreditStatus(ctx.connection.address);
+  if (status.state === "unknown") {
+    return ctx.finish("error", "vault neodpověděl na dotaz na zůstatek kreditů — zkus to za chvíli.");
+  }
+  if (status.remainingUscrt === null || BigInt(status.remainingUscrt) === 0n) {
+    return ctx.finish("error", "na tohle potřebuješ nějaké kredity — nejdřív pošli poctivý převod.");
+  }
+
+  const remaining = BigInt(status.remainingUscrt);
+  const amount = BigInt(ctx.amountBase);
+  if (amount > BigInt(ctx.balanceBefore)) {
+    return ctx.finish("error", "na dobití o zadanou částku nemáš dost sSCRT.");
+  }
+
+  // Cosmos charges the limit, so the limit is the fee. For the boundary case, make it exactly
+  // what is left; otherwise leave the usual headroom.
+  const gasLimit = boundary ? Math.floor(Number(remaining) / GAS_PRICE_USCRT) : GAS_TOPUP;
+  const feeUscrt = BigInt(Math.ceil(gasLimit * GAS_PRICE_USCRT));
+
+  if (boundary && gasLimit < 400_000) {
+    return ctx.finish(
+      "error",
+      `zbývá ${scrt(remaining.toString())} kreditů, což vystačí jen na ${gasLimit} gasu — na tuhle ` +
+        "transakci je potřeba zhruba 700 000. Nejdřív kredity utrať, nebo je nech klesnout.",
+    );
+  }
+
+  const nativeBefore = await nativeBalance(ctx.connection.address);
+  ctx.log(
+    "info",
+    `kredity ${scrt(remaining.toString())}, dobíjím o ${sscrt(amount.toString())} ` +
+      `s gas limitem ${gasLimit} (poplatek ${scrt(feeUscrt.toString())})`,
+  );
+
+  const tx = await topUpGasCredits(
+    ctx.connection.client,
+    ctx.connection.address,
+    amount.toString(),
+    ctx.codeHash,
+    ctx.connection.address,
+    gasLimit,
+  );
+  ctx.result.txHash = tx.transactionHash;
+  ctx.result.txCode = tx.code;
+  ctx.log("info", `gas_used ${tx.gasUsed} z ${gasLimit} nakvótovaných`);
+
+  await measure(ctx, false);
+
+  if (tx.code !== 0) {
+    return ctx.finish(
+      "vulnerable",
+      `Transakce selhala (code ${tx.code}): ${tx.rawLog.slice(0, 200)}. Dobíjení nemůže být jedna ` +
+        "transakce — musí se rozdělit a práh přepočítat.",
+    );
+  }
+
+  const after = await queryRemaining(ctx.connection.address);
+  if (after === null) {
+    return ctx.finish("inconclusive", "transakce prošla, ale vault pak neodpověděl na dotaz na zůstatek.");
+  }
+
+  // The allowance should be what was there, less the fee the ante handler took, plus what was
+  // just paid in. The boundary case lands at exactly the top-up, because the remainder was zero
+  // and the grant was gone by the time the vault ran.
+  const expected = remaining - feeUscrt + amount;
+  const nativeAfter = await nativeBalance(ctx.connection.address);
+
+  if (BigInt(after) !== expected) {
+    return ctx.finish(
+      "vulnerable",
+      `Allowance je ${scrt(after)}, čekalo se ${scrt(expected.toString())}. Revoke-and-grant se ` +
+        "nesečetl s odečtením poplatku tak, jak dobíjení předpokládá.",
+    );
+  }
+
+  // Not "must be zero" but "must not have moved": the redeem adds native SCRT and the vault
+  // message spends it, so a wallet that already held some is fine — a changed balance is not.
+  if (nativeAfter !== nativeBefore) {
+    return ctx.finish(
+      "vulnerable",
+      `Nativní zůstatek se změnil z ${scrt(nativeBefore)} na ${scrt(nativeAfter)} — druhá zpráva ` +
+        "neutratila přesně to, co vydala první.",
+    );
+  }
+
+  return ctx.finish(
+    "as_expected",
+    boundary
+      ? `Prošlo i na hraně: poplatek ${scrt(feeUscrt.toString())} vyčerpal allowance na nulu, chain ` +
+        `grant během transakce smazal a vault udělil nový na ${scrt(after)}. Skutečný gas: ${tx.gasUsed}.`
+      : `Allowance sedí na uscrt (${scrt(after)}) a nativní zůstatek se nehnul — obě zprávy i ` +
+        `revoke-and-grant drží. Skutečný gas: ${tx.gasUsed} z ${gasLimit}.`,
+  );
 }
 
 async function runStealBootstrap(ctx: Ctx): Promise<RunResult> {
