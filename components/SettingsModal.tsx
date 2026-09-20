@@ -147,9 +147,19 @@ export function SettingsModal(props: {
         zneplatní. Není to slib, je to vlastnost.
       </p>
       <p className="note">
-        <strong>Co nevidí:</strong> komu posíláš a kolik. Ty transakce podepisuješ sám proti
-        vaultu a server v nich nefiguruje. Vidět je jen to, co je stejně veřejné na chainu —
-        adresa, čas a zaplacený poplatek.
+        <strong>Historii transakcí ne.</strong> Permit je omezený na dotaz „balance“ a kontrakt
+        historii bez oprávnění „history“ odmítne. Komu posíláš a kolik je navíc uvnitř
+        zašifrované zprávy, kterou server nikdy nevidí — ty transakce podepisuješ sám proti
+        vaultu a server v nich nefiguruje.
+      </p>
+      <p className="note">
+        <strong>Pozor ale: gas credits samy o sobě veřejné jsou.</strong> Fee grant je běžný
+        stav řetězce, ne stav kontraktu, takže leží mimo soukromí Secretu. Kdokoli si může
+        vypsat <em>všechny</em> uživatele tohohle vaultu i s jejich zbývajícím kreditem
+        (<span className="mono">/cosmos/feegrant/v1beta1/issued/{config.gasVaultAddress.slice(0, 12)}…</span>)
+        a sledováním toho čísla vyčíst, kdy a jak často odesíláš. Částky ani příjemce z toho
+        nevyčte. Není to o providerovi — vidí to úplně každý, a platit poplatek vlastním SCRT
+        by tě do takového seznamu nedalo.
       </p>
       <p className="note">
         Permit níž je <strong>jiný</strong> — ten, kterým tenhle prohlížeč čte tvůj zůstatek.
