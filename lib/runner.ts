@@ -379,7 +379,14 @@ async function buyFirstCredits(ctx: Ctx): Promise<string | undefined> {
     `provider prodá ${scrt(onboard.data.creditsUscrt)} kreditů za ${sscrt(onboard.data.creditPriceSscrt)}`,
   );
 
-  const quote = await providerApi.purchaseQuote(ctx.connection.address, ctx.connection.pubkeyBase64);
+  // Buy what the onboarding said this wallet can afford, not the advertised size. A wallet that
+  // has only ever been paid privately in sSCRT may hold less than a full purchase, and sending
+  // it away to buy more sSCRT is the one thing this is supposed to avoid.
+  const quote = await providerApi.purchaseQuote(
+    ctx.connection.address,
+    ctx.connection.pubkeyBase64,
+    onboard.data.creditsUscrt,
+  );
   if (!quote.ok) return `provider odmítl kvótu: ${quote.error} — ${quote.message}`;
   ctx.log("info", `kvóta ${quote.data.quoteId.slice(0, 8)}, platba ${sscrt(quote.data.sscrtPaymentAmount)}`);
 
